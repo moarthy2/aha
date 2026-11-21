@@ -21,6 +21,7 @@ HOOK="$DISCORD_WEBHOOK"
 TMP="${RUNNER_TEMP:-/tmp}"
 IDFILE="$TMP/discord_msg_id"
 STARTFILE="$TMP/discord_start"
+SEENFILE="$TMP/discord_seen"
 LASTFILE="$TMP/discord_last.json"
 INTERVAL="${STATUS_INTERVAL:-10}"
 LIMIT=$(( ${LIMIT_MIN:-335} * 60 ))
@@ -32,8 +33,13 @@ PORT="${PORT:-25565}"
 IRAN_FILE="$TMP/discord_iran.txt"
 PING_INTERVAL="${PING_INTERVAL:-300}"   # seconds between Iran ping checks
 
+# Prints the new message id. Failures go to stderr (the workflow keeps that log).
 post() {
-  curl -s -m 10 -H 'Content-Type: application/json' -d "$1" "$HOOK?wait=true" | jq -r '.id // empty' 2>/dev/null
+  local body id
+  body=$(curl -s -m 10 -H 'Content-Type: application/json' -d "$1" "$HOOK?wait=true")
+  id=$(jq -r '.id // empty' <<<"$body" 2>/dev/null)
+  [ -z "$id" ] && echo "[$(date -u +%T)] discord post failed: ${body:-no response}" >&2
+  echo "$id"
 }
 # prints the HTTP status code; retries once on rate limit
 edit() {
@@ -183,18 +189,25 @@ if [ "$MODE" = "final" ]; then
   fi
   UP="—"
   [ -n "$START" ] && UP=$(fmt $(( $(date +%s) - START )))
+  # everyone who joined during this run
+  SEEN=$(sort -u "$SEENFILE" 2>/dev/null | grep . | paste -sd, - | sed 's/,/, /g')
+  SEEN_N=$(sort -u "$SEENFILE" 2>/dev/null | grep -c .)
 
   if [ -s "$LASTFILE" ]; then
-    # reuse the last status embed: keep address/region/uptime, drop live fields
-    JSON=$(jq --arg t "🔴 Offline · Run #$RUN_NUMBER" --arg m "$MSG" --arg up "$UP" --arg ts "$(date -u +%FT%TZ)" '
+    # reuse the last status embed: keep address/region, replace live fields by a summary
+    JSON=$(jq --arg t "🔴 Offline · Run #$RUN_NUMBER" --arg m "$MSG" --arg up "$UP" \
+      --arg seen "${SEEN:-—}" --arg n "$SEEN_N" --arg ts "$(date -u +%FT%TZ)" '
       .embeds[0] |= (
         .title = $t | .color = 15548997 | .timestamp = $ts
         | .description = (.description + "\n\n" + $m)
-        | .fields |= map(select(.name == "Uptime"))
-        | .fields |= map(.value = $up))' "$LASTFILE")
+        | .fields = [{name:"Uptime",value:$up,inline:true},
+                     {name:("Players this run ("+$n+")"),value:$seen,inline:false}])' "$LASTFILE")
   else
-    JSON=$(jq -n --arg t "🔴 Offline · Run #$RUN_NUMBER" --arg d "$MSG" --arg ts "$(date -u +%FT%TZ)" \
-      '{embeds:[{title:$t,description:$d,color:15548997,timestamp:$ts}]}')
+    JSON=$(jq -n --arg t "🔴 Offline · Run #$RUN_NUMBER" --arg d "$MSG" --arg up "$UP" \
+      --arg seen "${SEEN:-—}" --arg n "$SEEN_N" --arg ts "$(date -u +%FT%TZ)" \
+      '{embeds:[{title:$t,description:$d,color:15548997,timestamp:$ts,
+        fields:[{name:"Uptime",value:$up,inline:true},
+                {name:("Players this run ("+$n+")"),value:$seen,inline:false}]}]}')
   fi
 
   code=""
@@ -205,14 +218,16 @@ if [ "$MODE" = "final" ]; then
 fi
 
 # ---- run mode ----
-rm -f "$IDFILE" "$LASTFILE"
+rm -f "$IDFILE" "$LASTFILE" "$SEENFILE"
 START=$(date +%s)
 echo "$START" > "$STARTFILE"
-AZ=$(curl -sf -m 3 -H 'Metadata:true' 'http://169.254.169.254/metadata/instance/compute/location?api-version=2021-02-01&format=text')
-GEO=$(curl -sf -m 5 https://ipinfo.io/json)
-CITY=$(echo "$GEO" | jq -r '.city // empty' 2>/dev/null)
-CC=$(echo "$GEO" | jq -r '.country // empty' 2>/dev/null)
-REGION="${AZ:-?} (${CITY:-?}, ${CC:-?})"
+echo "[$(date -u +%T)] monitor started (run #$RUN_NUMBER, log=$LOG, port=$PORT)" >&2
+trap 'echo "[$(date -u +%T)] monitor exited" >&2' EXIT
+
+# The first status message is posted right away; the region lookup (slow) happens
+# after it so a quick crash still leaves a status message to edit.
+REGION="…"
+GEO_DONE=""
 
 PREV=""
 ID=""
@@ -235,6 +250,7 @@ while true; do
   # new message for each join (Minecraft yellow) and leave (Minecraft red)
   for p in $(comm -13 <(echo "$PREV") <(echo "$CUR")); do
     note "➕ **$p** joined · ${COUNT} online" 16777045
+    echo "$p" >> "$SEENFILE"
   done
   for p in $(comm -23 <(echo "$PREV") <(echo "$CUR")); do
     note "➖ **$p** left · ${COUNT} online" 16733525
@@ -286,29 +302,20 @@ while true; do
     ID=$(post "$JSON")
     [ -n "$ID" ] && echo "$ID" > "$IDFILE"
   else
-    edit "$ID" "$JSON" >/dev/null
+    code=$(edit "$ID" "$JSON")
+    if [ "$code" != "200" ]; then
+      echo "[$(date -u +%T)] discord edit failed: HTTP $code" >&2
+      [ "$code" = "404" ] && ID=""   # message was deleted: post a new one
+    fi
   fi
-  sleep "$INTERVAL"
-donefmt $EL)" --arg left "$(fmt $LEFT)" \
-    --arg cpu "${CPU}%" --arg ram "$RAM" \
-    --arg cnt "$COUNT" --arg list "${CUR//$'\n'/, }" \
-    --arg iname "$IRAN_NAME" --arg ival "$IRAN_VAL" \
-    --arg run "$RUN_URL" --arg ts "$(date -u +%FT%TZ)" \
-    '{embeds:[{title:$title,url:$run,description:$desc,color:$color,timestamp:$ts,
-      fields:[
-        {name:"Uptime",value:$up,inline:true},
-        {name:"Restart in",value:$left,inline:true},
-        {name:"Resources",value:("CPU "+$cpu+" · "+$ram),inline:true},
-        {name:("Players ("+$cnt+")"),value:(if $list=="" then "—" else $list end),inline:false},
-        {name:$iname,value:$ival,inline:false}
-      ]}]}')
-  printf '%s' "$JSON" > "$LASTFILE"
 
-  if [ -z "$ID" ]; then
-    ID=$(post "$JSON")
-    [ -n "$ID" ] && echo "$ID" > "$IDFILE"
-  else
-    edit "$ID" "$JSON" >/dev/null
+  if [ -z "$GEO_DONE" ]; then
+    GEO_DONE=1
+    AZ=$(curl -sf -m 3 -H 'Metadata:true' 'http://169.254.169.254/metadata/instance/compute/location?api-version=2021-02-01&format=text')
+    GEO=$(curl -sf -m 5 https://ipinfo.io/json)
+    CITY=$(echo "$GEO" | jq -r '.city // empty' 2>/dev/null)
+    CC=$(echo "$GEO" | jq -r '.country // empty' 2>/dev/null)
+    REGION="${AZ:-?} (${CITY:-?}, ${CC:-?})"
   fi
   sleep "$INTERVAL"
 done
