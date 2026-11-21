@@ -3,9 +3,9 @@
 #
 # Messages per server run:
 #   1. one status embed, posted when the run starts and edited in place
-#   2. one short message each time a player joins
+#   2. one short message each time a player joins (yellow) or leaves (red)
 #   3. at shutdown the status embed is edited into its final "offline" state
-# The next run posts a fresh status embed. Leaves only update the embed.
+# The next run posts a fresh status embed.
 #
 # Players are read from two independent sources and merged:
 #   - the server logs (ANSI codes stripped), for exact join events
@@ -155,7 +155,7 @@ while true; do
   EL=$(( $(date +%s) - START ))
   LEFT=$(( LIMIT - EL )); [ "$LEFT" -lt 0 ] && LEFT=0
   CPU=$(vmstat 1 2 | tail -1 | awk '{print 100-$15}')
-  JRAM=$(ps -C java -o rss= | awk '{s+=$1} END{printf "%d MB", s/1024}')
+  RAM=$(free -m | awk '/Mem:/{printf "%d/%d MB",$3,$2}')   # used/total, whole machine
 
   # merge log-based and ping-based player lists
   PING=$(ping_server)
@@ -164,9 +164,12 @@ while true; do
   COUNT=$(echo -n "$CUR" | grep -c .)
   [[ "$PING_ON" =~ ^[0-9]+$ ]] && [ "$PING_ON" -gt "$COUNT" ] && COUNT="$PING_ON"
 
-  # new message only for joins; leaves just update the status embed
+  # new message for each join (Minecraft yellow) and leave (Minecraft red)
   for p in $(comm -13 <(echo "$PREV") <(echo "$CUR")); do
-    note "➕ **$p** joined · ${COUNT} online" 5763719
+    note "➕ **$p** joined · ${COUNT} online" 16777045
+  done
+  for p in $(comm -23 <(echo "$PREV") <(echo "$CUR")); do
+    note "➖ **$p** left · ${COUNT} online" 16733525
   done
   PREV="$CUR"
 
@@ -175,14 +178,14 @@ while true; do
     --arg title "$STATE_TXT · Run #$RUN_NUMBER" --argjson color "$STATE_COLOR" \
     --arg desc "🌐 \`$ADDR\` · 📍 $REGION" \
     --arg up "$(fmt $EL)" --arg left "$(fmt $LEFT)" \
-    --arg cpu "${CPU}%" --arg jram "$JRAM" \
+    --arg cpu "${CPU}%" --arg ram "$RAM" \
     --arg cnt "$COUNT" --arg list "${CUR//$'\n'/, }" \
     --arg run "$RUN_URL" --arg ts "$(date -u +%FT%TZ)" \
     '{embeds:[{title:$title,url:$run,description:$desc,color:$color,timestamp:$ts,
       fields:[
         {name:"Uptime",value:$up,inline:true},
         {name:"Restart in",value:$left,inline:true},
-        {name:"Resources",value:("CPU "+$cpu+" · Java "+$jram),inline:true},
+        {name:"Resources",value:("CPU "+$cpu+" · "+$ram),inline:true},
         {name:("Players ("+$cnt+")"),value:(if $list=="" then "—" else $list end),inline:false}
       ]}]}')
   printf '%s' "$JSON" > "$LASTFILE"
