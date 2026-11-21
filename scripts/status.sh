@@ -7,7 +7,8 @@
 #   3. at shutdown the status embed is edited into its final "offline" state
 # The next run posts a fresh status embed.
 # The status embed also shows the connection latency measured from probes in
-# Iran (check-host.net), refreshed every PING_INTERVAL seconds (default 300).
+# Iran (Globalping, falling back to check-host.net), refreshed every
+# PING_INTERVAL seconds (default 300).
 # If the public port is not 25565 and there is no SRV record, set SERVER_ADDRESS
 # to host:port.
 #
@@ -117,42 +118,77 @@ resolve_target() {
   echo "${srv:-$ADDR:25565}"
 }
 
-# GET against check-host.net. Prints the body on HTTP 200; otherwise prints
-# nothing and records the reason in $IRAN_FILE.err.
-ch() {
+UA='Mozilla/5.0 (compatible; mc-status/1.0)'
+
+# curl wrapper: prints the body on HTTP 2xx. Otherwise prints nothing, returns 1
+# and stores the reason in $IRAN_FILE.err.
+http() {
   local out code
-  out=$(curl -s -m 8 -A 'Mozilla/5.0 (compatible; mc-status/1.0)' -H 'Accept: application/json' \
-    -w '\n%{http_code}' "$@")
+  out=$(curl -s -m 10 -A "$UA" -w '\n%{http_code}' "$@")
   code="${out##*$'\n'}"
-  if [ "$code" = "200" ]; then printf '%s' "${out%$'\n'*}"; return 0; fi
+  case "$code" in 2??) printf '%s' "${out%$'\n'*}"; return 0 ;; esac
   [ "$code" = "000" ] && code="no response"
   echo "HTTP $code" > "$IRAN_FILE.err"
   return 1
 }
+why() { cat "$IRAN_FILE.err" 2>/dev/null; }
 
-# TCP-connect latency to the server as seen from probes inside Iran, using the
-# free check-host.net API (no Iranian server needed).
-# Output: first line = average ms ("-" if there is no usable data), then one
-# line per probe (or a short error explanation).
-iran_ping() {
-  local nodes args=() target resp id res n t0 err
-  fail() { printf '%s\n%s\n' "-" "check-host: $1 ($(cat "$IRAN_FILE.err" 2>/dev/null))"; }
+# Provider 1: Globalping (api.globalping.io). TCP ping from probes in Iran.
+# Prints "<avg ms or ->" then one line per probe. On provider failure prints
+# one error line and returns 1. A GLOBALPING_TOKEN (optional) raises its limits.
+gp_ping() {
+  local host port body resp id res t0 out auth=()
   rm -f "$IRAN_FILE.err"
-  nodes=$(ch https://check-host.net/nodes/hosts \
+  host="${TARGET%:*}"; port="${TARGET##*:}"
+  [ -n "$GLOBALPING_TOKEN" ] && auth=(-H "Authorization: Bearer $GLOBALPING_TOKEN")
+  body=$(jq -n --arg t "$host" --argjson p "$port" \
+    '{type:"ping",target:$t,locations:[{country:"IR"}],limit:4,
+      measurementOptions:{protocol:"TCP",port:$p,packets:3}}')
+  resp=$(http -X POST -H 'Content-Type: application/json' "${auth[@]}" -d "$body" \
+    https://api.globalping.io/v1/measurements) \
+    || { echo "globalping: request failed ($(why))"; return 1; }
+  id=$(jq -r '.id // empty' <<<"$resp" 2>/dev/null)
+  [ -z "$id" ] && { echo "globalping: no measurement id"; return 1; }
+  t0=$SECONDS
+  while [ $(( SECONDS - t0 )) -lt 45 ]; do
+    sleep 1
+    res=$(http "${auth[@]}" "https://api.globalping.io/v1/measurements/$id") || continue
+    [ "$(jq -r '.status' <<<"$res" 2>/dev/null)" != "in-progress" ] && break
+  done
+  [ -z "$res" ] && { echo "globalping: no result ($(why))"; return 1; }
+  out=$(jq -r '
+    .results as $r
+    | if ($r | length) == 0 then empty else
+        ([$r[] | select(.result.status == "finished" and .result.stats.avg != null) | .result.stats.avg]) as $t
+        | (if ($t | length) == 0 then "-" else (($t | add / length) | round | tostring) end),
+          ($r[] | ((.probe.city // .probe.country) + (if .probe.network then " (" + .probe.network[:20] + ")" else "" end)) as $n
+            | if .result.status == "finished" and .result.stats.avg != null then "\($n): \(.result.stats.avg | round) ms"
+              elif .result.status == "in-progress" then "\($n): …"
+              else "\($n): ✖ \(if .result.stats.loss == 100 then "no reply" else "failed" end)" end)
+      end' <<<"$res" 2>/dev/null)
+  [ -z "$out" ] && { echo "globalping: no Iranian probes available"; return 1; }
+  echo "$out"
+}
+
+# Provider 2 (fallback): check-host.net TCP check from its Iranian nodes.
+ch_ping() {
+  local nodes args=() resp id res n t0 H=(-H 'Accept: application/json')
+  rm -f "$IRAN_FILE.err"
+  nodes=$(http "${H[@]}" https://check-host.net/nodes/hosts \
     | jq -r '([.nodes | to_entries[] | select(.value.location[0] | ascii_downcase == "ir") | .key])[:4][]' 2>/dev/null)
-  [ -z "$nodes" ] && { fail "no Iran nodes"; return; }
+  [ -z "$nodes" ] && { echo "check-host: no Iran nodes ($(why))"; return 1; }
   for n in $nodes; do args+=(--data-urlencode "node=$n"); done
-  target=$(resolve_target)
-  resp=$(ch -G --data-urlencode "host=$target" "${args[@]}" https://check-host.net/check-tcp)
+  resp=$(http "${H[@]}" -G --data-urlencode "host=$TARGET" "${args[@]}" https://check-host.net/check-tcp) \
+    || { echo "check-host: request failed ($(why))"; return 1; }
   id=$(jq -r '.request_id // empty' <<<"$resp" 2>/dev/null)
-  [ -z "$id" ] && { fail "check request failed"; return; }
+  [ -z "$id" ] && { echo "check-host: no request id"; return 1; }
   t0=$SECONDS
   while [ $(( SECONDS - t0 )) -lt 40 ]; do
     sleep 3
-    res=$(ch "https://check-host.net/check-result/$id")
+    res=$(http "${H[@]}" "https://check-host.net/check-result/$id")
     jq -e 'length > 0 and all(.[]; . != null)' <<<"$res" >/dev/null 2>&1 && break
   done
-  [ -z "$res" ] && { fail "no result"; return; }
+  [ -z "$res" ] && { echo "check-host: no result ($(why))"; return 1; }
   jq -r --argjson nodes "$(jq '.nodes' <<<"$resp")" '
     to_entries
     | map({city: ($nodes[.key][2] // .key),
@@ -162,6 +198,19 @@ iran_ping() {
       (.[] | if .r == null then "\(.city): …"
              elif .r.time != null then "\(.city): \((.r.time * 1000) | round) ms"
              else "\(.city): ✖ \(.r.error // "failed")" end)' <<<"$res"
+}
+
+# Latency to the server as seen from Iran (no Iranian server needed): tries
+# Globalping first, then check-host.net. Output: first line = average ms ("-" if
+# there is no usable data), then one line per probe or per provider error.
+iran_ping() {
+  local out e1 e2
+  TARGET=$(resolve_target)
+  if out=$(gp_ping); then echo "$out"; return; fi
+  e1="$out"
+  if out=$(ch_ping); then echo "$out"; return; fi
+  e2="$out"
+  printf '%s\n%s\n%s\n' "-" "$e1" "$e2"
 }
 
 # Players currently online according to the logs (ANSI codes and CRs stripped).
@@ -260,11 +309,11 @@ while true; do
   state
 
   # Iran ping runs in the background (takes ~10 s) and is refreshed every
-  # PING_INTERVAL seconds once the server is online; retried after 60 s on failure.
+  # PING_INTERVAL seconds once the server is online; retried after 120 s on failure.
   if [ "$STATE_TXT" = "🟢 Online" ]; then
     NOW=$(date +%s)
     FIRST=$(head -1 "$IRAN_FILE" 2>/dev/null)
-    WAIT="$PING_INTERVAL"; { [ -z "$FIRST" ] || [ "$FIRST" = "-" ]; } && WAIT=60
+    WAIT="$PING_INTERVAL"; { [ -z "$FIRST" ] || [ "$FIRST" = "-" ]; } && WAIT=120
     if { [ -z "$IRAN_PID" ] || ! kill -0 "$IRAN_PID" 2>/dev/null; } && [ $(( NOW - IRAN_LAST )) -ge "$WAIT" ]; then
       IRAN_LAST=$NOW
       ( iran_ping > "$IRAN_FILE.tmp" 2>/dev/null; mv -f "$IRAN_FILE.tmp" "$IRAN_FILE" ) &
