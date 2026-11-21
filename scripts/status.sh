@@ -111,27 +111,42 @@ resolve_target() {
   echo "${srv:-$ADDR:25565}"
 }
 
+# GET against check-host.net. Prints the body on HTTP 200; otherwise prints
+# nothing and records the reason in $IRAN_FILE.err.
+ch() {
+  local out code
+  out=$(curl -s -m 8 -A 'Mozilla/5.0 (compatible; mc-status/1.0)' -H 'Accept: application/json' \
+    -w '\n%{http_code}' "$@")
+  code="${out##*$'\n'}"
+  if [ "$code" = "200" ]; then printf '%s' "${out%$'\n'*}"; return 0; fi
+  [ "$code" = "000" ] && code="no response"
+  echo "HTTP $code" > "$IRAN_FILE.err"
+  return 1
+}
+
 # TCP-connect latency to the server as seen from probes inside Iran, using the
 # free check-host.net API (no Iranian server needed).
-# Output: first line = average ms ("-" if every probe failed), then one line per probe.
-# Prints nothing if check-host.net could not be reached.
+# Output: first line = average ms ("-" if there is no usable data), then one
+# line per probe (or a short error explanation).
 iran_ping() {
-  local nodes args=() target resp id res n
-  nodes=$(curl -sf -m 10 -H 'Accept: application/json' https://check-host.net/nodes/hosts \
-    | jq -r '([.nodes | to_entries[] | select(.value.location[0] | ascii_downcase == "ir") | .key])[:4][]')
-  [ -z "$nodes" ] && return
+  local nodes args=() target resp id res n t0 err
+  fail() { printf '%s\n%s\n' "-" "check-host: $1 ($(cat "$IRAN_FILE.err" 2>/dev/null))"; }
+  rm -f "$IRAN_FILE.err"
+  nodes=$(ch https://check-host.net/nodes/hosts \
+    | jq -r '([.nodes | to_entries[] | select(.value.location[0] | ascii_downcase == "ir") | .key])[:4][]' 2>/dev/null)
+  [ -z "$nodes" ] && { fail "no Iran nodes"; return; }
   for n in $nodes; do args+=(--data-urlencode "node=$n"); done
   target=$(resolve_target)
-  resp=$(curl -sfG -m 10 -H 'Accept: application/json' --data-urlencode "host=$target" "${args[@]}" \
-    https://check-host.net/check-tcp)
-  id=$(jq -r '.request_id // empty' <<<"$resp")
-  [ -z "$id" ] && return
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
+  resp=$(ch -G --data-urlencode "host=$target" "${args[@]}" https://check-host.net/check-tcp)
+  id=$(jq -r '.request_id // empty' <<<"$resp" 2>/dev/null)
+  [ -z "$id" ] && { fail "check request failed"; return; }
+  t0=$SECONDS
+  while [ $(( SECONDS - t0 )) -lt 40 ]; do
     sleep 3
-    res=$(curl -sf -m 10 -H 'Accept: application/json' "https://check-host.net/check-result/$id")
+    res=$(ch "https://check-host.net/check-result/$id")
     jq -e 'length > 0 and all(.[]; . != null)' <<<"$res" >/dev/null 2>&1 && break
   done
-  [ -z "$res" ] && return
+  [ -z "$res" ] && { fail "no result"; return; }
   jq -r --argjson nodes "$(jq '.nodes' <<<"$resp")" '
     to_entries
     | map({city: ($nodes[.key][2] // .key),
@@ -244,7 +259,7 @@ while true; do
   [ "$STATE_TXT" = "🟢 Online" ] && IRAN_VAL="Measuring…"
   if [ -s "$IRAN_FILE" ]; then
     FIRST=$(head -1 "$IRAN_FILE")
-    if [ "$FIRST" = "-" ]; then IRAN_NAME="$IRAN_NAME · unreachable"; else IRAN_NAME="$IRAN_NAME · avg ${FIRST} ms"; fi
+    if [ "$FIRST" = "-" ]; then IRAN_NAME="$IRAN_NAME · no data"; else IRAN_NAME="$IRAN_NAME · avg ${FIRST} ms"; fi
     IRAN_VAL=$(tail -n +2 "$IRAN_FILE")
     [ -z "$IRAN_VAL" ] && IRAN_VAL="—"
   fi
@@ -253,6 +268,28 @@ while true; do
     --arg title "$STATE_TXT · Run #$RUN_NUMBER" --argjson color "$STATE_COLOR" \
     --arg desc "🌐 \`$ADDR\` · 📍 $REGION" \
     --arg up "$(fmt $EL)" --arg left "$(fmt $LEFT)" \
+    --arg cpu "${CPU}%" --arg ram "$RAM" \
+    --arg cnt "$COUNT" --arg list "${CUR//$'\n'/, }" \
+    --arg iname "$IRAN_NAME" --arg ival "$IRAN_VAL" \
+    --arg run "$RUN_URL" --arg ts "$(date -u +%FT%TZ)" \
+    '{embeds:[{title:$title,url:$run,description:$desc,color:$color,timestamp:$ts,
+      fields:[
+        {name:"Uptime",value:$up,inline:true},
+        {name:"Restart in",value:$left,inline:true},
+        {name:"Resources",value:("CPU "+$cpu+" · "+$ram),inline:true},
+        {name:("Players ("+$cnt+")"),value:(if $list=="" then "—" else $list end),inline:false},
+        {name:$iname,value:$ival,inline:false}
+      ]}]}')
+  printf '%s' "$JSON" > "$LASTFILE"
+
+  if [ -z "$ID" ]; then
+    ID=$(post "$JSON")
+    [ -n "$ID" ] && echo "$ID" > "$IDFILE"
+  else
+    edit "$ID" "$JSON" >/dev/null
+  fi
+  sleep "$INTERVAL"
+donefmt $EL)" --arg left "$(fmt $LEFT)" \
     --arg cpu "${CPU}%" --arg ram "$RAM" \
     --arg cnt "$COUNT" --arg list "${CUR//$'\n'/, }" \
     --arg iname "$IRAN_NAME" --arg ival "$IRAN_VAL" \
