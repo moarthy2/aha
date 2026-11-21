@@ -6,6 +6,10 @@
 #   2. one short message each time a player joins (yellow) or leaves (red)
 #   3. at shutdown the status embed is edited into its final "offline" state
 # The next run posts a fresh status embed.
+# The status embed also shows the connection latency measured from probes in
+# Iran (check-host.net), refreshed every PING_INTERVAL seconds (default 300).
+# If the public port is not 25565 and there is no SRV record, set SERVER_ADDRESS
+# to host:port.
 #
 # Players are read from two independent sources and merged:
 #   - the server logs (ANSI codes stripped), for exact join events
@@ -25,6 +29,8 @@ LOGS=("$LOG" logs/latest.log)
 ADDR="${SERVER_ADDRESS:-?}"
 PORT=$(sed -nE 's/^server-port=([0-9]+).*/\1/p' server.properties 2>/dev/null | head -1)
 PORT="${PORT:-25565}"
+IRAN_FILE="$TMP/discord_iran.txt"
+PING_INTERVAL="${PING_INTERVAL:-300}"   # seconds between Iran ping checks
 
 post() {
   curl -s -m 10 -H 'Content-Type: application/json' -d "$1" "$HOOK?wait=true" | jq -r '.id // empty' 2>/dev/null
@@ -93,6 +99,50 @@ for x in p.get("sample", []):
 PY
 }
 
+# host:port that players actually connect to. A port in SERVER_ADDRESS wins,
+# then a _minecraft._tcp SRV record (checked over DNS-over-HTTPS), then 25565.
+resolve_target() {
+  case "$ADDR" in *:*) echo "$ADDR"; return ;; esac
+  local srv
+  srv=$(curl -sf -m 5 -H 'Accept: application/dns-json' \
+    "https://cloudflare-dns.com/dns-query?name=_minecraft._tcp.${ADDR}&type=SRV" \
+    | jq -r '[.Answer[]? | select(.type == 33) | .data][0] // empty' 2>/dev/null \
+    | awk 'NF >= 4 {sub(/\.$/, "", $4); print $4 ":" $3}')
+  echo "${srv:-$ADDR:25565}"
+}
+
+# TCP-connect latency to the server as seen from probes inside Iran, using the
+# free check-host.net API (no Iranian server needed).
+# Output: first line = average ms ("-" if every probe failed), then one line per probe.
+# Prints nothing if check-host.net could not be reached.
+iran_ping() {
+  local nodes args=() target resp id res n
+  nodes=$(curl -sf -m 10 -H 'Accept: application/json' https://check-host.net/nodes/hosts \
+    | jq -r '([.nodes | to_entries[] | select(.value.location[0] | ascii_downcase == "ir") | .key])[:4][]')
+  [ -z "$nodes" ] && return
+  for n in $nodes; do args+=(--data-urlencode "node=$n"); done
+  target=$(resolve_target)
+  resp=$(curl -sfG -m 10 -H 'Accept: application/json' --data-urlencode "host=$target" "${args[@]}" \
+    https://check-host.net/check-tcp)
+  id=$(jq -r '.request_id // empty' <<<"$resp")
+  [ -z "$id" ] && return
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 3
+    res=$(curl -sf -m 10 -H 'Accept: application/json' "https://check-host.net/check-result/$id")
+    jq -e 'length > 0 and all(.[]; . != null)' <<<"$res" >/dev/null 2>&1 && break
+  done
+  [ -z "$res" ] && return
+  jq -r --argjson nodes "$(jq '.nodes' <<<"$resp")" '
+    to_entries
+    | map({city: ($nodes[.key][2] // .key),
+           r: (if .value == null then null else (.value | flatten[0]) end)})
+    | ([.[] | select(.r.time != null) | .r.time * 1000] ) as $t
+    | (if ($t | length) == 0 then "-" else (($t | add / length) | round | tostring) end),
+      (.[] | if .r == null then "\(.city): …"
+             elif .r.time != null then "\(.city): \((.r.time * 1000) | round) ms"
+             else "\(.city): ✖ \(.r.error // "failed")" end)' <<<"$res"
+}
+
 # Players currently online according to the logs (ANSI codes and CRs stripped).
 log_players() {
   cat "${LOGS[@]}" 2>/dev/null \
@@ -151,6 +201,9 @@ REGION="${AZ:-?} (${CITY:-?}, ${CC:-?})"
 
 PREV=""
 ID=""
+IRAN_PID=""
+IRAN_LAST=0
+rm -f "$IRAN_FILE" "$IRAN_FILE.tmp"
 while true; do
   EL=$(( $(date +%s) - START ))
   LEFT=$(( LIMIT - EL )); [ "$LEFT" -lt 0 ] && LEFT=0
@@ -174,19 +227,43 @@ while true; do
   PREV="$CUR"
 
   state
+
+  # Iran ping runs in the background (takes ~10 s) and is refreshed every
+  # PING_INTERVAL seconds once the server is online; retried after 60 s on failure.
+  if [ "$STATE_TXT" = "🟢 Online" ]; then
+    NOW=$(date +%s)
+    FIRST=$(head -1 "$IRAN_FILE" 2>/dev/null)
+    WAIT="$PING_INTERVAL"; { [ -z "$FIRST" ] || [ "$FIRST" = "-" ]; } && WAIT=60
+    if { [ -z "$IRAN_PID" ] || ! kill -0 "$IRAN_PID" 2>/dev/null; } && [ $(( NOW - IRAN_LAST )) -ge "$WAIT" ]; then
+      IRAN_LAST=$NOW
+      ( iran_ping > "$IRAN_FILE.tmp" 2>/dev/null; mv -f "$IRAN_FILE.tmp" "$IRAN_FILE" ) &
+      IRAN_PID=$!
+    fi
+  fi
+  IRAN_NAME="🇮🇷 Ping from Iran"; IRAN_VAL="—"
+  [ "$STATE_TXT" = "🟢 Online" ] && IRAN_VAL="Measuring…"
+  if [ -s "$IRAN_FILE" ]; then
+    FIRST=$(head -1 "$IRAN_FILE")
+    if [ "$FIRST" = "-" ]; then IRAN_NAME="$IRAN_NAME · unreachable"; else IRAN_NAME="$IRAN_NAME · avg ${FIRST} ms"; fi
+    IRAN_VAL=$(tail -n +2 "$IRAN_FILE")
+    [ -z "$IRAN_VAL" ] && IRAN_VAL="—"
+  fi
+
   JSON=$(jq -n \
     --arg title "$STATE_TXT · Run #$RUN_NUMBER" --argjson color "$STATE_COLOR" \
     --arg desc "🌐 \`$ADDR\` · 📍 $REGION" \
     --arg up "$(fmt $EL)" --arg left "$(fmt $LEFT)" \
     --arg cpu "${CPU}%" --arg ram "$RAM" \
     --arg cnt "$COUNT" --arg list "${CUR//$'\n'/, }" \
+    --arg iname "$IRAN_NAME" --arg ival "$IRAN_VAL" \
     --arg run "$RUN_URL" --arg ts "$(date -u +%FT%TZ)" \
     '{embeds:[{title:$title,url:$run,description:$desc,color:$color,timestamp:$ts,
       fields:[
         {name:"Uptime",value:$up,inline:true},
         {name:"Restart in",value:$left,inline:true},
         {name:"Resources",value:("CPU "+$cpu+" · "+$ram),inline:true},
-        {name:("Players ("+$cnt+")"),value:(if $list=="" then "—" else $list end),inline:false}
+        {name:("Players ("+$cnt+")"),value:(if $list=="" then "—" else $list end),inline:false},
+        {name:$iname,value:$ival,inline:false}
       ]}]}')
   printf '%s' "$JSON" > "$LASTFILE"
 
