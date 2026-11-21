@@ -4,12 +4,17 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   actions: write
 
 concurrency:
   group: mc-server
   cancel-in-progress: false
+
+env:
+  TAG: world-data
+  ARCHIVE: world.tar.zst
+  GH_REPO: ${{ github.repository }}
 
 jobs:
   server:
@@ -24,19 +29,26 @@ jobs:
           java-version: ${{ vars.JAVA_VERSION || '25' }}
 
       - name: Restore data
-        uses: actions/cache/restore@v4
-        with:
-          path: data
-          key: mc-data-${{ github.run_id }}
-          restore-keys: mc-data-
+        id: restore
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p data
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release download "$TAG" --pattern "$ARCHIVE" --dir .
+            tar --zstd -xf "$ARCHIVE" -C data
+            rm -f "$ARCHIVE"
+            echo "Data restored"
+          else
+            echo "No saved data yet, starting fresh"
+          fi
 
       - name: Prepare server
         env:
           JAR_URL: ${{ vars.SERVER_JAR_URL }}
         run: |
-          mkdir -p data
           curl -fsSL -o server.jar "$JAR_URL"
-          if [ -d config ]; then cp -r config/. data/; fi
+          if [ -d server ]; then cp -r server/. data/; fi
           echo "eula=true" > data/eula.txt
 
       - name: Start playit tunnel
@@ -57,15 +69,39 @@ jobs:
             echo "healthy=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Save data
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            data
-            !data/logs
-            !data/cache
-          key: mc-data-${{ github.run_id }}
+      - name: Save data to release
+        if: always() && steps.restore.conclusion == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tar --zstd -cf "$ARCHIVE" -C data \
+            --exclude='logs' --exclude='cache' --exclude='*.jar' --exclude='server.log' .
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "World data" \
+              --notes "Automatic server data backup. Do not delete." --latest=false
+          fi
+          gh release upload "$TAG" "$ARCHIVE" --clobber
+
+      - name: Add generated config files to repo
+        if: always() && steps.restore.conclusion == 'success'
+        run: |
+          mkdir -p server
+          rsync -am --ignore-existing \
+            --include='server.properties' --include='bukkit.yml' \
+            --include='spigot.yml' --include='commands.yml' \
+            --include='ops.json' --include='whitelist.json' \
+            --include='config/' --include='config/*.yml' \
+            --include='plugins/' --include='plugins/*/' \
+            --include='plugins/*/config.yml' \
+            --exclude='*' data/ server/
+          if [ -n "$(git status --porcelain server)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add server
+            git commit -m "Add generated server config files"
+            git pull --rebase origin "$GITHUB_REF_NAME" || true
+            git push || true
+          fi
 
       - name: Queue next run
         if: ${{ !cancelled() && steps.srv.outputs.healthy == 'true' && vars.AUTO_RESTART != 'false' }}
