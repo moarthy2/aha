@@ -62,9 +62,20 @@ jobs:
       - name: Run server
         id: srv
         working-directory: data
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          SERVER_ADDRESS: ${{ vars.SERVER_ADDRESS || 'dedication-octet.tun.ply.gg' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_NUMBER: ${{ github.run_number }}
+          STATUS_INTERVAL: ${{ vars.STATUS_INTERVAL || '10' }}
+          LIMIT_MIN: '335'
+          LOG: server.log
         run: |
           start=$(date +%s)
+          bash ../scripts/status.sh run >/dev/null 2>&1 &
+          MON=$!
           timeout -s TERM 335m java -Xms8G -Xmx10G -jar ../server.jar nogui > server.log 2>&1 || true
+          kill "$MON" 2>/dev/null || true
           if [ $(( $(date +%s) - start )) -gt 600 ]; then
             echo "healthy=true" >> "$GITHUB_OUTPUT"
           fi
@@ -108,3 +119,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh workflow run mc-server.yml --repo "$GITHUB_REPOSITORY"
+
+      - name: Discord final message
+        if: always()
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          RUN_NUMBER: ${{ github.run_number }}
+          HEALTHY: ${{ steps.srv.outputs.healthy }}
+          JOB_STATUS: ${{ job.status }}
+          AUTO_RESTART: ${{ vars.AUTO_RESTART }}
+        run: bash scripts/status.sh final >/dev/null 2>&1 || true
