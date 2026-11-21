@@ -72,7 +72,7 @@ jobs:
           LOG: server.log
         run: |
           start=$(date +%s)
-          bash ../scripts/status.sh run >/dev/null 2>&1 &
+          bash ../scripts/status.sh run >"$RUNNER_TEMP/monitor.log" 2>&1 &
           MON=$!
           timeout -s TERM 335m java -Xms8G -Xmx10G -jar ../server.jar nogui > server.log 2>&1 || true
           kill "$MON" 2>/dev/null || true
@@ -128,4 +128,10 @@ jobs:
           HEALTHY: ${{ steps.srv.outputs.healthy }}
           JOB_STATUS: ${{ job.status }}
           AUTO_RESTART: ${{ vars.AUTO_RESTART }}
-        run: bash scripts/status.sh final >/dev/null 2>&1 || true
+        run: |
+          if [ -s "$RUNNER_TEMP/monitor.log" ]; then
+            echo "::group::Discord monitor log"
+            tail -n 100 "$RUNNER_TEMP/monitor.log"
+            echo "::endgroup::"
+          fi
+          bash scripts/status.sh final >/dev/null 2>&1 || true
