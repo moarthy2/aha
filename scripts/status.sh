@@ -4,7 +4,7 @@
 # Messages per server run:
 #   1. one status embed, posted when the run starts and edited in place
 #   2. one short message each time a player joins (yellow) or leaves (red)
-#   3. at shutdown the status embed is edited into its final "offline" state
+#   3. at shutdown the status embed is deleted (no "offline" message is sent)
 # The next run posts a fresh status embed.
 # The status embed also shows the connection latency measured from probes in
 # Iran (Globalping, falling back to check-host.net), refreshed every
@@ -21,9 +21,6 @@ HOOK="$DISCORD_WEBHOOK"
 [ -z "$HOOK" ] && exit 0
 TMP="${RUNNER_TEMP:-/tmp}"
 IDFILE="$TMP/discord_msg_id"
-STARTFILE="$TMP/discord_start"
-SEENFILE="$TMP/discord_seen"
-LASTFILE="$TMP/discord_last.json"
 INTERVAL="${STATUS_INTERVAL:-10}"
 LIMIT=$(( ${LIMIT_MIN:-335} * 60 ))
 LOG="${LOG:-server.log}"
@@ -229,47 +226,19 @@ state() {
 }
 
 if [ "$MODE" = "final" ]; then
+  # No shutdown message: just remove this run's status embed so a stale
+  # "Online" card is not left behind. Join/leave messages stay.
   ID=$(cat "$IDFILE" 2>/dev/null)
-  START=$(cat "$STARTFILE" 2>/dev/null)
-  if [ "$HEALTHY" = "true" ] && [ "$JOB_STATUS" != "cancelled" ] && [ "$AUTO_RESTART" != "false" ]; then
-    MSG="🔄 World saved. The next run starts automatically (about 1–2 min of downtime) and will post a new message."
-  else
-    MSG="⛔ No automatic restart. Run the workflow manually to start the server."
+  if [ -n "$ID" ]; then
+    code=$(curl -s -m 10 -o /dev/null -w '%{http_code}' -X DELETE "$HOOK/messages/$ID")
+    [ "$code" = "429" ] && { sleep 5; curl -s -m 10 -o /dev/null -X DELETE "$HOOK/messages/$ID"; }
   fi
-  UP="—"
-  [ -n "$START" ] && UP=$(fmt $(( $(date +%s) - START )))
-  # everyone who joined during this run
-  SEEN=$(sort -u "$SEENFILE" 2>/dev/null | grep . | paste -sd, - | sed 's/,/, /g')
-  SEEN_N=$(sort -u "$SEENFILE" 2>/dev/null | grep -c .)
-
-  if [ -s "$LASTFILE" ]; then
-    # reuse the last status embed: keep address/region, replace live fields by a summary
-    JSON=$(jq --arg t "🔴 Offline · Run #$RUN_NUMBER" --arg m "$MSG" --arg up "$UP" \
-      --arg seen "${SEEN:-—}" --arg n "$SEEN_N" --arg ts "$(date -u +%FT%TZ)" '
-      .embeds[0] |= (
-        .title = $t | .color = 15548997 | .timestamp = $ts
-        | .description = (.description + "\n\n" + $m)
-        | .fields = [{name:"Uptime",value:$up,inline:true},
-                     {name:("Players this run ("+$n+")"),value:$seen,inline:false}])' "$LASTFILE")
-  else
-    JSON=$(jq -n --arg t "🔴 Offline · Run #$RUN_NUMBER" --arg d "$MSG" --arg up "$UP" \
-      --arg seen "${SEEN:-—}" --arg n "$SEEN_N" --arg ts "$(date -u +%FT%TZ)" \
-      '{embeds:[{title:$t,description:$d,color:15548997,timestamp:$ts,
-        fields:[{name:"Uptime",value:$up,inline:true},
-                {name:("Players this run ("+$n+")"),value:$seen,inline:false}]}]}')
-  fi
-
-  code=""
-  [ -n "$ID" ] && code=$(edit "$ID" "$JSON")
-  # no message to edit (or edit failed): post the final state as a new message
-  [ "$code" != "200" ] && post "$JSON" >/dev/null
   exit 0
 fi
 
 # ---- run mode ----
-rm -f "$IDFILE" "$LASTFILE" "$SEENFILE"
+rm -f "$IDFILE"
 START=$(date +%s)
-echo "$START" > "$STARTFILE"
 echo "[$(date -u +%T)] monitor started (run #$RUN_NUMBER, log=$LOG, port=$PORT)" >&2
 trap 'echo "[$(date -u +%T)] monitor exited" >&2' EXIT
 
@@ -299,7 +268,6 @@ while true; do
   # new message for each join (Minecraft yellow) and leave (Minecraft red)
   for p in $(comm -13 <(echo "$PREV") <(echo "$CUR")); do
     note "➕ **$p** joined · ${COUNT} online" 16777045
-    echo "$p" >> "$SEENFILE"
   done
   for p in $(comm -23 <(echo "$PREV") <(echo "$CUR")); do
     note "➖ **$p** left · ${COUNT} online" 16733525
@@ -345,7 +313,6 @@ while true; do
         {name:("Players ("+$cnt+")"),value:(if $list=="" then "—" else $list end),inline:false},
         {name:$iname,value:$ival,inline:false}
       ]}]}')
-  printf '%s' "$JSON" > "$LASTFILE"
 
   if [ -z "$ID" ]; then
     ID=$(post "$JSON")
