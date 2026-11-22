@@ -1,7 +1,7 @@
 mineskin:
   # Create a free key at https://account.mineskin.org/keys
   # Needed to turn the PNG files in plugins/CustomSkins/skins/ into skins Minecraft clients accept.
-  api-key: ""
+  api-key: "msk_hQCO2sot_A43b3gIAzLmb7YmeckiKXLyXCb0C-ZcXcU6VX-YAIC2pthsU1_aYjtJXKldOk4PN"
   user-agent: "CustomSkins/1.0"
   # Pause between uploads so MineSkin rate limits are not hit
   upload-delay-seconds: 4
