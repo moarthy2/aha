@@ -1,0 +1,37 @@
+mineskin:
+  # Create a free key at https://account.mineskin.org/keys
+  # Needed to turn the PNG files in plugins/CustomSkins/skins/ into skins Minecraft clients accept.
+  api-key: ""
+  user-agent: "CustomSkins/1.0"
+  # Pause between uploads so MineSkin rate limits are not hit
+  upload-delay-seconds: 4
+
+# Everyone can use /setskin and /setcape, but must type this password as the last word:
+#   /setskin skin1 Steve <password>
+# Change it here. If it is empty, the commands refuse to work.
+password: "parethy8725"
+
+# Extra named capes for /setcape (optional). The built-in ones are:
+#   migrator, vanilla, minecon-2011, minecon-2012, minecon-2013, minecon-2015,
+#   minecon-2016, mojang, mojang-studios, cherry-blossom, scrolls, pan
+# Add or fix one with:   name: <64-character texture hash>
+# The hash is the last part of the cape's texture URL: https://textures.minecraft.net/texture/<hash>
+# A full textures.minecraft.net URL also works. Example:
+#   capes:
+#     my-cape: 2340c0e03dd24a11b15a8b33c2a7e9e32abb2051b2481d0ba7defd635ca7a933
+capes: {}
+
+messages:
+  prefix: "<gray>[<aqua>Skins</aqua>]</gray> "
+  usage-skin: "<yellow>/setskin <file|none|list> <player> <password></yellow>"
+  usage-cape: "<yellow>/setcape <cape-name|none|list> <player> <password></yellow>"
+  player-not-found: "<red>No online player matches <white><name></white>.</red>"
+  file-not-found: "<red>No <white><file></white> in the <white><folder></white> list. Use <white>list</white> to see what is available.</red>"
+  working: "<gray>Loading <file>...</gray>"
+  skin-done: "<green>Skin <white><file></white> linked to <white><players></white>.</green>"
+  cape-done: "<green>Cape <white><file></white> linked to <white><players></white>.</green>"
+  cleared: "<green>Removed the <what> of <white><players></white>.</green>"
+  list: "<gray>Available <what>: <white><names></white></gray>"
+  wrong-password: "<red>Wrong password.</red>"
+  password-not-set: "<red>No password is set in config.yml, so the command is disabled.</red>"
+  failed: "<red>Failed: <reason></red>"
