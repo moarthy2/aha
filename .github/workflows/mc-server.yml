@@ -51,13 +51,28 @@ jobs:
           if [ -d server ]; then cp -r server/. data/; fi
           echo "eula=true" > data/eula.txt
 
-      - name: Start playit tunnel
+      - name: Start SSH tunnel to AWS
         env:
-          SECRET_KEY: ${{ secrets.PLAYIT_SECRET }}
+          AWS_HOST: ${{ secrets.AWS_HOST }}
+          AWS_SSH_KEY: ${{ secrets.AWS_SSH_KEY }}
+          AWS_HOST_KEY: ${{ secrets.AWS_HOST_KEY }}
         run: |
-          docker run -d --name playit --net=host \
-            -e SECRET_KEY="$SECRET_KEY" \
-            ghcr.io/playit-cloud/playit-agent:1.0
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$AWS_SSH_KEY" > ~/.ssh/tunnel_key
+          chmod 600 ~/.ssh/tunnel_key
+          printf '%s\n' "$AWS_HOST_KEY" > ~/.ssh/known_hosts
+          setsid nohup bash -c '
+            while true; do
+              ssh -N -i ~/.ssh/tunnel_key \
+                -o StrictHostKeyChecking=yes \
+                -o ServerAliveInterval=20 -o ServerAliveCountMax=3 \
+                -o ExitOnForwardFailure=yes \
+                -R 0.0.0.0:25565:localhost:25565 tunnel@"$AWS_HOST"
+              sleep 3
+            done' > "$HOME/tunnel.log" 2>&1 < /dev/null &
+          sleep 5
+          echo "--- tunnel log ---"
+          cat "$HOME/tunnel.log"
 
       - name: Run server
         id: srv
