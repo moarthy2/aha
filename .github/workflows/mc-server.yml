@@ -54,11 +54,11 @@ jobs:
       - name: Start SSH tunnel to AWS
         env:
           AWS_HOST: ${{ secrets.AWS_HOST }}
-          AWS_SSH_KEY: ${{ secrets.AWS_SSH_KEY }}
+          AWS_SSH_KEY_B64: ${{ secrets.AWS_SSH_KEY_B64 }}
           AWS_HOST_KEY: ${{ secrets.AWS_HOST_KEY }}
         run: |
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
-          printf '%s\n' "$AWS_SSH_KEY" > ~/.ssh/tunnel_key
+          printf '%s' "$AWS_SSH_KEY_B64" | base64 -d > ~/.ssh/tunnel_key
           chmod 600 ~/.ssh/tunnel_key
           printf '%s\n' "$AWS_HOST_KEY" > ~/.ssh/known_hosts
           setsid nohup bash -c '
